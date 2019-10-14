@@ -1,0 +1,379 @@
+---
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, eval=TRUE, cache=TRUE)
+```
+
+#### Book Chapter: Build high-quality MST panels in R
+
+
+First we setup the working environment by importing some packages and writing helper functions.
+
+```{r}
+# load packages
+library(Rirt)
+library(Rmst)
+library(dplyr, warn.conflicts=FALSE)
+library(ggplot2, warn.conflicts=FALSE)
+library(reshape2, warn.conflicts=FALSE)
+set.seed(112358)
+
+# helper: generate item attributes
+gen_attr <- function(n){
+  cbind(id=1:n, content=sample(4, n, replace=TRUE), 
+        time=round(rlnorm(n, 4.0, .28)), 
+        group=sort(sample(n/2, n, replace=TRUE))) 
+}
+```
+
+```{r, echo=FALSE}
+# helper: describe a numeric vector
+describe <- function(x){
+  c(mean=mean(x), std=sd(x), min=min(x), max=max(x)) %>% round(., 2)
+}
+
+# helper: item attribute distribution on routes
+summarize_route <- function(x){
+  rs <- NULL
+  for(p in 1:x$n_panel)
+    for(i in 1:x$n_routes){
+      x_items <- mst_get_items(x, panel_ix=p, route_ix=i) %>%
+        Map(function(x) if(is.null(x)) NULL else select(x, content, time, type), .) %>%
+        Reduce(rbind, .)
+      rs <- rbind(rs, with(x_items, c(panel=p, route=i, freq(content, 1:4)$freq, round(mean(time)), freq(type, c('3PL', 'GPCM', 'GRM'))$freq)))
+    }
+  rs <- data.frame(rs)
+  colnames(rs) <- c('panel', 'route', paste('content', 1:4, sep=''), 'time', 'n_3pl', 'n_gpcm', 'n_grm')
+  rs
+}
+
+# helper: item attribute distribution on modules
+summarize_module <- function(x){
+  rs <- NULL
+  for(p in 1:x$n_panels)
+    for(i in 1:x$n_modules){
+      x_items <- mst_get_items(x, panel_ix=p, module_ix=i) %>%
+        Map(function(x) if(is.null(x)) NULL else select(x, content, time, type), .) %>%
+        Reduce(rbind, .)
+      rs <- rbind(rs, with(x_items, c(panel=p, module=i, freq(content, 1:4)$freq, round(mean(time)), freq(type, c('3PL', 'GPCM', 'GRM'))$freq)))
+    }
+  rs <- data.frame(rs)
+  rs$module <- apply(x$module[rs$module, c('stage', 'label')], 1, paste, collapse='')
+  colnames(rs) <- c('panel', 'module', paste('content', 1:4, sep=''), 'time', 'n_3pl', 'n_gpcm', 'n_grm')
+  rs
+}
+
+# helper: retrieve simulation results the administration of assembled panels
+get_simulation_results <- function(sims){
+  est_t <- Map(function(xx) {
+    cbind(true=xx$true, est=xx$theta, panel=xx$admin$'3pl'$panel[1], se=xx$stats$se[x$n_stages], info=xx$stats$info[x$n_stages],
+          route=x$module[xx$stats$route, c('stage', 'label')] %>% apply(., 1, paste, collapse='') %>% paste(., collapse='-'),
+          n_items=sum(xx$stats$n_items))
+  }, sims) %>% Reduce(rbind, .) %>% data.frame(., stringsAsFactors=FALSE)
+  mutate(est_t, true=round(as.numeric(true), 4), est=round(as.numeric(est), 4),
+                  info=round(as.numeric(info), 4), se=round(as.numeric(se), 4),
+                  n_items=as.integer(n_items), panel=paste('Panel', panel))
+}
+
+# helper: plot simulation results
+draw_simulation_results <- function(est_t){
+  mutate(est_t, lb=est-1.96*se, ub=est+1.96*se) %>%
+    ggplot(aes(true, est, ymin=lb, ymax=ub, color=route)) +
+    geom_linerange(color='skyblue',alpha=.5) + geom_point(alpha=.5) + facet_wrap(~panel) +
+    xlab(expression(paste('True ', theta))) + ylab(expression(paste('Estimated ', theta))) +
+    theme_bw() + scale_color_discrete(guide=guide_legend('Routes'))
+}
+```
+
+#### Generate item pool
+
+Generate an item pool of 600 3PL items, 40 four-category GPCM items, and 40 four-category GRM items.
+
+```{r}
+# generate item pool
+n_3pl <- 600
+n_gpcm <- 40
+n_grm <- 40
+items <- Rirt::model_mixed_gendata(1, n_3pl=n_3pl, n_gpcm=n_gpcm, n_grm=n_grm, n_c=4, a_dist=c(-.77, .33), b_dist=c(-0.86, 1.31), c_dist=c(7, 28), d_dist=c(0, 1))$items
+items$'3pl' <- cbind(items$'3pl', gen_attr(n_3pl), type='3PL')
+items$'gpcm' <- cbind(items$'gpcm', gen_attr(n_gpcm), type='GPCM')
+items$'grm' <- cbind(items$'grm', gen_attr(n_grm), type='GRM')
+```
+
+The distributions of item parameters in the generated item pool are:
+
+```{r, echo=FALSE}
+# describe item parameters
+select(items$'3pl', a, b, c) %>% apply(., 2, describe)
+select(items$'gpcm', a, b, d1, d2, d3, d4) %>% apply(., 2, describe)
+select(items$'grm', a, b1, b2, b3) %>% apply(., 2, describe)
+```
+
+The distributions of item attributes in the generated item pool are:
+
+```{r, echo=FALSE}
+# describe item attributes
+Map(function(x, y) Rirt::freq(x$content, 1:4) %>% select(value, perc) %>% mutate(type=y), items, names(items)) %>%
+  Reduce(rbind, .) %>% acast(type ~ value, value.var='perc') %>% round(., 2)
+Map(function(x) c(describe(x$time)), items) %>%
+  Reduce(rbind, .) %>% data.frame(., row.names=names(items))
+Map(function(x) with(freq(x$group), c(n=length(freq), describe(freq))), items) %>%
+  Reduce(rbind, .) %>% data.frame(., row.names=names(items))
+```
+
+The test information functions (TIFs) of the entire item pool and by item types are:
+
+```{r, echo=FALSE, fig.height=3, fig.width=6}
+# describe item informations
+theta <- seq(-5, 5, .1)
+info <- Rirt::model_mixed_info(theta, items, combine=TRUE)
+info <- aggregate(t(info), by=list(type=unlist(Map(function(x) x$type, items))), sum)[,-1] %>% 
+  t() %>% data.frame(theta=theta, total=rowSums(info), ., row.names=NULL)
+colnames(info) <- c('theta', 'Total', '3PL', 'GPCM', 'GRM')
+melt(info, id.var='theta') %>% 
+  mutate(size=ifelse(variable=="Total", 2, 1), type=ifelse(variable!="Total", "solid", "dotted")) %>%
+  ggplot(aes(theta, value, color=variable, size=size, linetype=type)) + geom_line() + 
+  xlab(expression(theta)) + ylab("Test Information Function") +
+  theme_bw() + scale_color_discrete(guide=guide_legend("")) + 
+  scale_size_continuous(range=c(.8, 1.5)) + 
+  guides(size=FALSE, linetype=FALSE)
+ggsave('graph_TifPool.png', height=3, width=6)
+```
+
+
+#### Example 1
+
+Assemble 2 non-overlapping panels of 1-2 MST using the top-down approach, and solve the model by lp_solve under a time limit of 15 minutes.
+
+Psychometric requirements:
+
++ maximize TIF over [-1.64, 0.00] in the easy route
++ maximize TIF over [0.00, 1.64] in the hard route
++ at least 10 items in Stage 1
+
+Content requirements:
+
++ 40 items in each route
++ 36 3PL items, 2 GPCM items, and 2 GRM items in each route
++ 9 to 11 items in every one of the four content areas in each route
++ an average response time of 56 to 64 seconds per item in each route
+
+```{r}
+x <- mst(items, '1-2', n_panels=2, method='topdown', test_len=40, max_use=1)
+x <- mst_objective(x, seq(-1.64, 0, length.out=3), 'max', indices=1)
+x <- mst_objective(x, seq(0,  1.64, length.out=3), 'max', indices=2)
+x <- mst_constraint(x, 'type', min=36, max=36, level='3PL')
+x <- mst_constraint(x, 'type', min=2, max=2, level='GPCM')
+x <- mst_constraint(x, 'type', min=2, max=2, level='GRM')
+for(i in 1:4)
+  x <- mst_constraint(x, 'content', min=9, max=11, level=i)
+x <- mst_constraint(x, 'time', min=56*40, max=64*40)
+x <- mst_stage_length(x, 1, min=10)
+x <- mst_assemble(x, 'lpsolve', time_limit=60*15, message=FALSE)
+```
+
+Draw the TIFs of the routes in the assembled 1-2 MST panels.
+
+```{r, fig.height=3, fig.width=8}
+plot(x, byroute=TRUE, label=TRUE) + 
+  geom_vline(xintercept=seq(-1.64, 1.64, length.out=3), linetype=2, color='gray50')
+```
+
+Draw the TIFs of the modules in the assembled 1-2 MST panels.
+
+```{r, fig.height=4, fig.width=8}
+plot(x, byroute=FALSE, label=TRUE) + 
+  geom_vline(xintercept=seq(-1.64, 1.64, length.out=3), linetype=2, color='gray50')
+```
+
+Summarize the distributions of the item attributes in each route and module.
+
+```{r, echo=FALSE}
+summarize_route(x) %>% mutate(route=factor(route, 1:2, c('1M-2E', '1M-2H')))
+summarize_module(x)
+```
+
+Administer the assembled panels to 3,000 test takers whose true abilities are sampled from a standard normal distribution in a Monte-Carlo simulation study. Use the maximum information routing rule.
+
+```{r}
+true_t <- rnorm(3000, mean=0, sd=1)
+est_t <- Map(function(t) mst_sim(x, t, rdp=NULL), true_t)
+```
+
+Summarize the overall and by-route and simulation results.
+
+```{r, echo=FALSE}
+est_t <- get_simulation_results(est_t)
+group_by(est_t, panel, route) %>% 
+  summarise(N=n(), n_items=mean(n_items), corr=cor(true, est), rmse=rmse(true, est), se=mean(se))
+with(est_t, c(corr=cor(true, est), rmse=rmse(true, est))) %>% round(., 2)
+```
+
+Visualize the simulation results.
+
+```{r, echo=FALSE, fig.height=3, fig.width=8}
+draw_simulation_results(est_t)
+```
+
+
+#### Example 2
+
+Assemble 2 non-overlapping panels of 1-3 MST uisng the bottom-up approach, and solve the model by lp_solve under a time limit of 15 minutes.
+
+Psychometric requirements:
+
++ maximize TIF over [-0.65,  0.65] in the M moduels
++ maximize TIF over [-1.96, -0.65] in the E moduels
++ maximize TIF over [ 0.65,  1.96] in the H moduels
+
+Content requirements:
+
++ 20 items in each module
++ 18 3PL items, 2 GPCM items, and 2 GRM items in each route
++ 9 to 11 items in every one of the four content areas in each route
++ an average response time of 56 to 64 seconds per item in each route
+
+```{r}
+x <- mst(items, '1-3', n_panels=2, method='bottomup', test_len=20, max_use=1)
+x <- mst_objective(x, seq(-0.65,  0.65, length.out=3), 'max', indices=c(1,3))
+x <- mst_objective(x, seq(-1.96, -0.65, length.out=3), 'max', indices=2)
+x <- mst_objective(x, seq( 0.65,  1.96, length.out=3), 'max', indices=4)
+x <- mst_constraint(x, 'type', min=18, max=18, level='3PL')
+x <- mst_constraint(x, 'type', min=0, max=2, level='GPCM')
+x <- mst_constraint(x, 'type', min=0, max=2, level='GRM')
+for(i in 1:4)
+  x <- mst_constraint(x, 'content', min=4, max=6, level=i)
+x <- mst_constraint(x, 'time', min=56*20, max=64*20)
+x <- mst_assemble(x, 'lpsolve', time_limit=60*15, message=FALSE)
+```
+
+Draw the TIFs of the routes in the assembled 1-3 MST panels.
+
+```{r, fig.height=3, fig.width=8}
+plot(x, byroute=TRUE, label=TRUE) + 
+  geom_vline(xintercept=seq(-1.96, 1.96, length.out=3), linetype=2, color='gray50')
+```
+
+Draw the TIFs of the modules in the assembled 1-3 MST panels.
+
+```{r, fig.height=4, fig.width=8}
+plot(x, byroute=FALSE, label=TRUE) + 
+  geom_vline(xintercept=seq(-1.96, 1.96, length.out=3), linetype=2, color='gray50')
+```
+
+Summarize the distributions of the item attributes in each route and module.
+
+```{r, echo=FALSE}
+summarize_route(x) %>% mutate(route=factor(route, 1:3, c('1M-2E', '1M-2M', '1M-2H')))
+summarize_module(x)
+```
+
+Administer the assembled panels to 3,000 test takers whose true abilities are sampled from a standard normal distribution in a Monte-Carlo simulation study. Use the maximum information routing rule.
+
+```{r}
+true_t <- rnorm(3000, mean=0, sd=1)
+est_t <- Map(function(t) mst_sim(x, t, rdp=NULL), true_t)
+```
+
+Summarize the overall and by-route and simulation results.
+
+```{r, echo=FALSE}
+est_t <- get_simulation_results(est_t)
+group_by(est_t, panel, route) %>% 
+  summarise(N=n(), n_items=mean(n_items), corr=cor(true, est), rmse=rmse(true, est), se=mean(se))
+with(est_t, c(corr=cor(true, est), rmse=rmse(true, est))) %>% round(., 2)
+```
+
+Visualize the simulation results.
+
+```{r, echo=FALSE, fig.height=3, fig.width=8}
+draw_simulation_results(est_t)
+```
+
+
+#### Example 3
+
+Assemble 1 panel of 1-2-3 MST using a hybrid approach, and solve the model by GLPK under a time limit of 15 minutes. In the hybrid approach, content requirements are controlled holistically at the route level, and psychometric requirements are controlled locally at the module level. Block two routes with capricious score change: 1M-2E-3H, 1M-2H-3E. Items are allowed to be resued up to 3 items.
+
+Psychometric requirements:
+
++ maximize TIF over [-0.67,  0.67] in Module 1M 
++ maximize TIF over [-1.28,  0.00] in Module 2E
++ maximize TIF over [ 0.00,  1.28] in Module 2H
++ maximize TIF over [-1.28, -0.38] in Module 3E
++ maximize TIF over [-0.38,  0.38] in Module 3M
++ maximize TIF over [ 0.38,  1.28] in Module 3H
++ Anchor the TIF intersection of 2E and 2H at 0.00
+
+Content requirements:
+
++ 40 items in each route
++ 36 3PL items, 2 GPCM items, and 2 GRM items in each route
++ 8 to 12 items in every one of the four content areas in each route
++ an average response time of 54 to 66 seconds per item in each route
++ Each item can be used up to 3 times
+
+```{r}
+x <- mst(items, '1-2-3', n_panels=1, method='topdown', test_len=40, max_use=3, group='group')
+x <- mst_route(x, c(1, 2, 6), "-")
+x <- mst_route(x, c(1, 3, 4), "-")
+x <- mst_objective(x, seq(-0.67,  0.67, length.out=3), 'max', indices=1, method='bottomup')
+x <- mst_objective(x, seq(-1.28,  0.00, length.out=4)[2:3], 'max', indices=2, method='bottomup')
+x <- mst_objective(x, seq( 0.00,  1.28, length.out=4)[2:3], 'max', indices=3, method='bottomup')
+x <- mst_objective(x, seq(-1.28, -0.38, length.out=3), 'max', indices=4, method='bottomup')
+x <- mst_objective(x, seq(-0.38,  0.38, length.out=3), 'max', indices=5, method='bottomup')
+x <- mst_objective(x, seq( 0.38,  1.28, length.out=3), 'max', indices=6, method='bottomup')
+x <- mst_rdp(x, 0, 2:3, tol=.5)
+x <- mst_constraint(x, 'type', min=36, max=36, level='3PL')
+x <- mst_constraint(x, 'type', min=2, max=2, level='GPCM')
+x <- mst_constraint(x, 'type', min=2, max=2, level='GRM')
+for(i in 1:4)
+  x <- mst_constraint(x, 'content', min=8, max=12, level=i)
+x <- mst_constraint(x, 'time', min=54*40, max=66*40)
+x <- mst_assemble(x, 'glpk', time_limit=60*15, message=FALSE)
+```
+
+Draw the TIFs of the routes in the assembled 1-2-3 MST panels.
+
+```{r, fig.height=3, fig.width=5}
+plot(x, byroute=TRUE, label=TRUE) + 
+  geom_vline(xintercept=seq(-1.28, 1.28, length.out=3), linetype=2, color='gray50')
+```
+
+Draw the TIFs of the modules in the assembled 1-2-3 MST panels.
+
+```{r, fig.height=3, fig.width=10}
+plot(x, byroute=FALSE, label=TRUE) + 
+  geom_vline(xintercept=seq(-1.28, 1.28, length.out=3), linetype=2, color='gray50')
+```
+
+Summarize the distributions of the item attributes in each route and module.
+
+```{r, echo=FALSE}
+summarize_route(x) %>% mutate(route=factor(route, 1:4, c('1M-2E-3E', '1M-2E-3M', '1M-2H-3M', '1M-2H-3H')))
+summarize_module(x)
+```
+
+Administer the assembled panels to 3,000 test takers whose true abilities are sampled from a standard normal distribution in a Monte-Carlo simulation study. Use the maximum information routing rule.
+
+```{r}
+true_t <- rnorm(3000, mean=0, sd=1)
+est_t <- Map(function(t) mst_sim(x, t, rdp=NULL), true_t)
+```
+
+Summarize the overall and by-route and simulation results.
+
+```{r, echo=FALSE}
+est_t <- get_simulation_results(est_t)
+group_by(est_t, panel, route) %>% 
+  summarise(N=n(), n_items=mean(n_items), corr=cor(true, est), rmse=rmse(true, est), se=mean(se))
+with(est_t, c(corr=cor(true, est), rmse=rmse(true, est))) %>% round(., 2)
+```
+
+Visualize the simulation results.
+
+```{r, echo=FALSE, fig.height=3, fig.width=5}
+draw_simulation_results(est_t)
+```
